@@ -1,569 +1,428 @@
-"""
-Домашнее задание №1
-Расчет элементов траектории ЛА на пассивном (баллистическом) участке
-Вариант 1: V01 = 230 м/с, V02 = 930 м/с
-
-Использует:
-- atmosphere.py - модуль атмосферы ГОСТ 4401-81
-- ODE_solvers.py - солверы ОДУ (Euler, RungeKutta4)
-"""
-
+import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.interpolate import interp1d
-from scipy.optimize import minimize_scalar
-from math import sin, cos, sqrt, radians, degrees
-
-# ============================================================
-# ПОДКЛЮЧЕНИЕ МОДУЛЕЙ
-# ============================================================
 from atmosphere import Atmosphere_GOST_4401_81
 from ODE_solvers import RungeKutta4
+from math import sin, cos, pi
+from scipy.interpolate import interp1d
+from scipy.optimize import minimize
+import matplotlib.pyplot as plt
+from concurrent.futures import ProcessPoolExecutor
+import time
 
 # ============================================================
-# ИСХОДНЫЕ ДАННЫЕ (Вариант 1)
+# ЦВЕТОВАЯ ПАЛИТРА (из 1-го кода)
 # ============================================================
-V01 = 230.0      # м/с - начальная скорость 1
-V02 = 930.0      # м/с - начальная скорость 2
-g0 = 9.80665     # м/с² - ускорение свободного падения
-m0 = 800.0       # кг - начальная масса ЛА
-Jz = 120.0       # кг·м² - момент инерции
-Sm = 0.2         # м² - характерная площадь
-dt = 0.1         # с - шаг интегрирования
-
-# Начальные углы бросания (градусы)
-theta0_degrees = [20.0, 30.0, 40.0, 50.0]
+COLOR_PALETTE = [
+    '#4C72B0',
+    '#55A868',
+    '#C44E52',
+    '#8172B2',
+    '#CCB974',
+    '#64B5CD'
+]
 
 # ============================================================
-# ТАБЛИЦЫ АЭРОДИНАМИЧЕСКИХ КОЭФФИЦИЕНТОВ
+# ИСХОДНЫЕ ДАННЫЕ (Вариант 1 — из 2-го кода)
 # ============================================================
-M_table = np.array([0.01, 0.55, 0.8, 0.9, 1.0, 1.06, 1.1, 1.2, 1.3, 1.4, 2.0, 2.6, 3.4, 6.0, 10.0])
-Cxa_table = np.array([0.30, 0.30, 0.55, 0.70, 0.84, 0.86, 0.87, 0.83, 0.80, 0.79, 0.65, 0.55, 0.50, 0.45, 0.40])
-Cya_table = np.array([0.25, 0.25, 0.25, 0.20, 0.30, 0.31, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25])
+V_initial_1 = 268.0  # м/с
+V_initial_2 = 948.0  # м/с
+time_start = 0.0
+coord_x_start = 0.0
+coord_y_start = 0.0
+angular_velocity_start = 0.0
 
-Cxa_interp = interp1d(M_table, Cxa_table, kind='linear', fill_value='extrapolate')
-Cya_interp = interp1d(M_table, Cya_table, kind='linear', fill_value='extrapolate')
+theta_c_start_1 = np.radians(20.0)
+theta_c_start_2 = np.radians(30.0)
+theta_c_start_3 = np.radians(40.0)
+theta_c_start_4 = np.radians(50.0)
+
+mass_vehicle = 800.0  # кг
+inertia_moment = 120.0  # кг·м²
+distance_cp_cm = 0.4  # м — плечо аэродин. момента (из 1-го кода)
+reference_area = 0.2  # м²
+time_step = 0.1  # с
 
 # ============================================================
 # ИНИЦИАЛИЗАЦИЯ АТМОСФЕРЫ
 # ============================================================
-atm = Atmosphere_GOST_4401_81()
+atmosphere_model = Atmosphere_GOST_4401_81()
+gravity_accel = atmosphere_model.g
 
 # ============================================================
-# ФУНКЦИИ ДЛЯ РАСЧЕТА АЭРОДИНАМИЧЕСКИХ СИЛ
+# ПАРАМЕТРЫ ОПТИМИЗАЦИИ
 # ============================================================
-def get_aeroforces(V, y, alpha=0.0):
-    T = atm.T(y)
-    a_sound = atm.a(y)
-    rho = atm.rho(y)
-    M = V / a_sound if a_sound > 0 else 0
-    Cxa = float(Cxa_interp(M))
-    Cya = float(Cya_interp(M))
-    q = rho * V**2 / 2.0
-    Xa = Cxa * Sm * q
-    Ya = Cya * Sm * q * alpha
-    return Xa, Ya, Cxa, Cya, M, a_sound, rho, T
+initial_theta_guess = np.radians(45.0)
+theta_bounds = [(10.0 * pi / 180, 80.0 * pi / 180)]  # границы из 2-го кода
+decimal_rounding = 5
 
 # ============================================================
-# СИСТЕМА ДИФФУРОВ И ФУНКЦИИ ДЛЯ ODE_solvers
+# ТАБЛИЦЫ АЭРОДИНАМИЧЕСКИХ КОЭФФИЦИЕНТОВ
 # ============================================================
-def ode_system(t, state):
-    V, theta_c, x, y = state
-    Xa, Ya, Cxa, Cya, M, a_sound, rho, T = get_aeroforces(V, y, alpha=0.0)
+mach_numbers = [0.01, 0.55, 0.8, 0.9, 1, 1.06, 1.1, 1.2, 1.3, 1.4, 2, 2.6, 3.4, 6, 10]
+drag_coeff_data = [0.3, 0.3, 0.55, 0.7, 0.84, 0.86, 0.87, 0.83, 0.8, 0.79, 0.65, 0.55, 0.5, 0.45, 0.4]
+lift_coeff_data = [0.25, 0.25, 0.25, 0.2, 0.3, 0.31, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25]
 
-    dV_dt = -Xa / m0 - g0 * sin(theta_c)
-    dtheta_c_dt = -g0 * cos(theta_c) / V
-    dx_dt = V * cos(theta_c)
-    dy_dt = V * sin(theta_c)
+drag_interpolator = interp1d(mach_numbers, drag_coeff_data, kind="linear", fill_value="extrapolate")
+lift_interpolator = interp1d(mach_numbers, lift_coeff_data, kind="linear", fill_value="extrapolate")
 
-    return np.array([dV_dt, dtheta_c_dt, dx_dt, dy_dt])
 
-def stop_conditions(t, state):
-    return state[3] + 1e-6
+def get_drag_coefficient(mach):
+    return float(drag_interpolator(mach))
 
-def report(t, state):
-    V, theta_c, x, y = state
-    Xa, Ya, Cxa, Cya, M, a_sound, rho, T = get_aeroforces(V, y, alpha=0.0)
 
-    dV_dt = -Xa / m0 - g0 * sin(theta_c)
-    dtheta_dt = -g0 * cos(theta_c) / V
-    dx_dt = V * cos(theta_c)
-    dy_dt = V * sin(theta_c)
+def get_lift_coefficient(mach):
+    return float(lift_interpolator(mach))
 
-    alpha_deg = 0.0
-    theta_deg = degrees(theta_c)
-    omega_z = 0.0
-    Mz = 0.0
-    p = rho * atm.R * T
-
-    return np.array([
-        Xa, Ya, Cxa, Cya, M, a_sound, rho, T,
-        dV_dt, dtheta_dt, dx_dt, dy_dt,
-        alpha_deg, theta_deg, omega_z, Mz, p
-    ])
 
 # ============================================================
-# ИНТЕГРИРОВАНИЕ ТРАЕКТОРИИ
+# СИСТЕМА ДИФФУРОВ (6 DOF — логика из 1-го кода)
 # ============================================================
-def integrate_trajectory(V0, theta0_deg, dt=0.1):
-    theta0 = radians(theta0_deg)
-    init_conditions = np.array([V0, theta0, 0.0, 0.0])
+def equations_of_motion(time, state_vector):
+    derivatives = np.zeros(6)
 
-    res = RungeKutta4(
-        ode_system=ode_system,
-        init_conditions=init_conditions,
-        stop_conditions=stop_conditions,
-        report=report,
-        dx=dt,
-        x_0=0.0,
+    velocity = state_vector[0]
+    flight_path_angle = state_vector[1]
+    coord_x = state_vector[2]
+    coord_y = state_vector[3]
+    angular_rate = state_vector[4]
+    pitch_angle = state_vector[5]
+
+    mach_current = velocity / atmosphere_model.a(coord_y)
+    angle_of_attack = pitch_angle - flight_path_angle
+
+    air_density = atmosphere_model.rho(coord_y)
+    drag_force = 0.5 * get_drag_coefficient(mach_current) * reference_area * air_density * velocity ** 2
+    lift_force = 0.5 * get_lift_coefficient(
+        mach_current) * reference_area * air_density * angle_of_attack * velocity ** 2
+    pitch_moment = -0.5 * (get_drag_coefficient(mach_current) + get_lift_coefficient(
+        mach_current)) * reference_area * distance_cp_cm * velocity ** 2
+
+    derivatives[0] = -drag_force / mass_vehicle - gravity_accel * sin(flight_path_angle)
+    derivatives[1] = lift_force / (mass_vehicle * velocity) - gravity_accel * cos(flight_path_angle) / velocity
+    derivatives[2] = velocity * cos(flight_path_angle)
+    derivatives[3] = velocity * sin(flight_path_angle)
+    derivatives[4] = pitch_moment * angle_of_attack / inertia_moment
+    derivatives[5] = angular_rate
+
+    return derivatives
+
+
+def ground_impact_condition(time, state_vector):
+    return state_vector[3] + 1e-10
+
+
+def compute_report_parameters(time, state_vector):
+    report_data = np.zeros(16)
+
+    velocity = state_vector[0]
+    flight_path_angle = state_vector[1]
+    coord_y = state_vector[3]
+    pitch_angle = state_vector[5]
+
+    mach_current = velocity / atmosphere_model.a(coord_y)
+    angle_of_attack = pitch_angle - flight_path_angle
+    air_density = atmosphere_model.rho(coord_y)
+
+    drag_force = 0.5 * get_drag_coefficient(mach_current) * reference_area * air_density * velocity ** 2
+    lift_force = 0.5 * get_lift_coefficient(
+        mach_current) * reference_area * air_density * angle_of_attack * velocity ** 2
+    pitch_moment = -0.5 * (get_drag_coefficient(mach_current) + get_lift_coefficient(
+        mach_current)) * reference_area * distance_cp_cm * velocity ** 2
+
+    report_data[0] = angle_of_attack
+    report_data[1] = mass_vehicle
+    report_data[2] = atmosphere_model.a(coord_y)
+    report_data[3] = mach_current
+    report_data[4] = get_drag_coefficient(mach_current)
+    report_data[5] = drag_force
+    report_data[6] = -drag_force / mass_vehicle - gravity_accel * sin(flight_path_angle)
+    report_data[7] = get_lift_coefficient(mach_current)
+    report_data[8] = lift_force
+    report_data[9] = lift_force / (mass_vehicle * velocity) - gravity_accel * cos(flight_path_angle) / velocity
+    report_data[10] = velocity * sin(flight_path_angle)
+    report_data[11] = velocity * cos(flight_path_angle)
+    report_data[12] = pitch_moment
+    report_data[13] = pitch_moment * angle_of_attack / inertia_moment
+    report_data[14] = air_density
+    report_data[15] = atmosphere_model.p(coord_y)
+
+    return report_data
+
+
+# ============================================================
+# КОРРЕКЦИЯ ТОЧКИ КАСАНИЯ (из 1-го кода)
+# ============================================================
+def correct_impact_point(trajectory):
+    y_previous = trajectory[-2, 4]
+    y_current = trajectory[-1, 4]
+
+    if y_current > 0:
+        return trajectory
+
+    interpolation_fraction = y_previous / (y_previous - y_current)
+    corrected_trajectory = trajectory.copy()
+
+    for col_idx in range(corrected_trajectory.shape[1]):
+        corrected_trajectory[-1, col_idx] = trajectory[-2, col_idx] + interpolation_fraction * (
+                    trajectory[-1, col_idx] - trajectory[-2, col_idx])
+
+    return corrected_trajectory
+
+
+def solve_trajectory(initial_conditions):
+    V0, theta_c0 = initial_conditions
+    pitch_angle_initial = theta_c0
+    initial_state = [V0, theta_c0, coord_x_start, coord_y_start, angular_velocity_start, pitch_angle_initial]
+
+    trajectory = RungeKutta4(
+        equations_of_motion,
+        initial_state,
+        ground_impact_condition,
+        compute_report_parameters,
+        time_step,
+        x_0=time_start,
         max_steps=100_000
     )
+    return correct_impact_point(trajectory)
 
-    results = {
-        't': res[:, 0],
-        'V': res[:, 1],
-        'theta_c': res[:, 2],
-        'theta_c_deg': np.degrees(res[:, 2]),
-        'x': res[:, 3],
-        'y': res[:, 4],
-        'Xa': res[:, 5],
-        'Ya': res[:, 6],
-        'Cxa': res[:, 7],
-        'Cya': res[:, 8],
-        'M': res[:, 9],
-        'a': res[:, 10],
-        'rho': res[:, 11],
-        'T': res[:, 12],
-        'dV_dt': res[:, 13],
-        'dtheta_dt': res[:, 14],
-        'dx_dt': res[:, 15],
-        'dy_dt': res[:, 16],
-        'alpha_deg': res[:, 17],
-        'theta_deg': res[:, 18],
-        'omega_z': res[:, 19],
-        'Mz': res[:, 20],
-        'p': res[:, 21],
-    }
-
-    return results
 
 # ============================================================
-# ПОИСК ОПТИМАЛЬНОГО УГЛА
+# ОПТИМИЗАЦИЯ УГЛА (логика из 1-го кода, границы из 2-го)
 # ============================================================
-def find_optimal_angle(V0, dt=0.1):
-    def negative_range(theta_deg):
-        if theta_deg <= 0 or theta_deg >= 90:
-            return 0
-        traj = integrate_trajectory(V0, theta_deg, dt)
-        return -traj['x'][-1]
-
-    result = minimize_scalar(negative_range, bounds=(10, 80), method='bounded')
-    return result.x, -result.fun
-
-# ============================================================
-# ВЫВОД ТАБЛИЦЫ (шаг 1 секунда)
-# ============================================================
-def print_table(results, V0, theta0_deg, step_sec=1.0):
-    print(f"\n{'='*120}")
-    print(f"ТАБЛИЦА 3. Результаты расчета для V0 = {V0} м/с, theta0 = {theta0_deg}°")
-    print(f"{'='*120}")
-
-    header = (
-        "N | t,с | m,кг | V,м/с | a,м/с | M | Cxa | Xa,Н | alpha,град | "
-        "theta_c,град | dV/dt,м/с² | Ya,Н || rho,кг/м³ | p,Па | dy/dt,м/с | "
-        "x,м | dx/dt,м/с | theta,град | omega_z,с⁻¹ | domega/dt,с⁻² | Mz,Н·м | y,м"
-    )
-    print(header)
-    print("-" * 160)
-
-    t_array = results['t']
-    idx_step = int(step_sec / dt)
-
-    row_num = 1
-    for i in range(0, len(t_array), idx_step):
-        domega_dt = 0.0
-
-        row = (
-            f"{row_num:2d} | {t_array[i]:5.1f} | {m0:6.1f} | {results['V'][i]:7.2f} | "
-            f"{results['a'][i]:7.2f} | {results['M'][i]:5.3f} | {results['Cxa'][i]:5.3f} | "
-            f"{results['Xa'][i]:9.2f} | {results['alpha_deg'][i]:7.4f} | "
-            f"{results['theta_c_deg'][i]:9.4f} | {results['dV_dt'][i]:10.4f} | "
-            f"{results['Ya'][i]:8.2f} || {results['rho'][i]:10.6f} | {results['p'][i]:10.2f} | "
-            f"{results['dy_dt'][i]:8.2f} | {results['x'][i]:10.2f} | "
-            f"{results['dx_dt'][i]:8.2f} | {results['theta_deg'][i]:8.4f} | "
-            f"{results['omega_z'][i]:6.4f} | {domega_dt:8.4f} | {results['Mz'][i]:8.2f} | "
-            f"{results['y'][i]:8.2f}"
+def optimize_launch_angle(initial_velocity):
+    def objective_function(angle_vars):
+        launch_angle = angle_vars[0]
+        pitch_angle_initial = launch_angle
+        initial_state = [initial_velocity, launch_angle, coord_x_start, coord_y_start, angular_velocity_start,
+                         pitch_angle_initial]
+        trajectory = correct_impact_point(
+            RungeKutta4(
+                equations_of_motion,
+                initial_state,
+                ground_impact_condition,
+                compute_report_parameters,
+                time_step,
+                x_0=time_start,
+                max_steps=100_000
+            )
         )
-        print(row)
-        row_num += 1
+        return -trajectory[-1, 3]  # максимизация дальности x
 
-    # Последняя точка (касание)
-    last_idx = len(t_array) - 1
-    if last_idx % idx_step != 0 and last_idx > 0:
-        domega_dt = 0.0
-        row = (
-            f"{row_num:2d} | {t_array[last_idx]:5.1f} | {m0:6.1f} | {results['V'][last_idx]:7.2f} | "
-            f"{results['a'][last_idx]:7.2f} | {results['M'][last_idx]:5.3f} | {results['Cxa'][last_idx]:5.3f} | "
-            f"{results['Xa'][last_idx]:9.2f} | {results['alpha_deg'][last_idx]:7.4f} | "
-            f"{results['theta_c_deg'][last_idx]:9.4f} | {results['dV_dt'][last_idx]:10.4f} | "
-            f"{results['Ya'][last_idx]:8.2f} || {results['rho'][last_idx]:10.6f} | {results['p'][last_idx]:10.2f} | "
-            f"{results['dy_dt'][last_idx]:8.2f} | {results['x'][last_idx]:10.2f} | "
-            f"{results['dx_dt'][last_idx]:8.2f} | {results['theta_deg'][last_idx]:8.4f} | "
-            f"{results['omega_z'][last_idx]:6.4f} | {domega_dt:8.4f} | {results['Mz'][last_idx]:8.2f} | "
-            f"{results['y'][last_idx]:8.2f}"
-        )
-        print(row)
+    result = minimize(objective_function, bounds=theta_bounds, x0=initial_theta_guess, method='SLSQP')
+    return result
 
-    print(f"\nМаксимальная дальность: {results['x'][-1]:.2f} м")
-    print(f"Время полета: {results['t'][-1]:.2f} с")
-    print(f"Скорость в момент касания: {results['V'][-1]:.2f} м/с")
 
 # ============================================================
-# ГРАФИКИ — ПУНКТ 1 (4 угла на одном графике)
+# ВЫВОД ТАБЛИЦЫ — КАК В 1-М КОДЕ (pandas + Excel)
 # ============================================================
-def plot_trajectories(all_results, V0, title_suffix=""):
-    # 1. y(x)
-    plt.figure(figsize=(10, 6))
-    for theta0, results in all_results.items():
-        plt.plot(results['x'], results['y'], label=f'θ₀ = {theta0}°', linewidth=1.5)
-    plt.xlabel('x, м')
-    plt.ylabel('y, м')
-    plt.title(f'Траектории ЛА y(x) {title_suffix}')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f'trajectories_yx_V{V0:.0f}.png', dpi=150)
-    plt.show()
+def create_results_dataframe(trajectory_data, filename):
+    dataframe = pd.DataFrame({
+        't': np.round(trajectory_data[:, 0], decimal_rounding),
+        'm': np.round(trajectory_data[:, 8], decimal_rounding),
+        'V': np.round(trajectory_data[:, 1], decimal_rounding),
+        'a': np.round(trajectory_data[:, 9], decimal_rounding),
+        'M': np.round(trajectory_data[:, 10], decimal_rounding),
+        'Cxa': np.round(trajectory_data[:, 11], decimal_rounding),
+        'Xa': np.round(trajectory_data[:, 12], decimal_rounding),
+        'α': np.round(np.degrees(trajectory_data[:, 7]), decimal_rounding),
+        'θ_c': np.round(np.degrees(trajectory_data[:, 2]), decimal_rounding),
+        'dV/dt': np.round(trajectory_data[:, 13], decimal_rounding),
+        'Cya': np.round(trajectory_data[:, 14], decimal_rounding),
+        'Ya': np.round(trajectory_data[:, 15], decimal_rounding),
+        'dθ_c/dt': np.round(trajectory_data[:, 16], decimal_rounding),
+        'ϑ': np.round(np.degrees(trajectory_data[:, 6]), decimal_rounding),
+        'y': np.round(trajectory_data[:, 4], decimal_rounding),
+        'dy/dt': np.round(trajectory_data[:, 17], decimal_rounding),
+        'x': np.round(trajectory_data[:, 3], decimal_rounding),
+        'dx/dt': np.round(trajectory_data[:, 18], decimal_rounding),
+        'Mza': np.round(trajectory_data[:, 19], decimal_rounding),
+        'ω_z': np.round(trajectory_data[:, 5], decimal_rounding),
+        'dω_z/dt': np.round(trajectory_data[:, 20], decimal_rounding),
+        'ρ': np.round(trajectory_data[:, 21], decimal_rounding),
+        'p': np.round(trajectory_data[:, 22], decimal_rounding)
+    })
 
-    # 2. V(t)
-    plt.figure(figsize=(10, 6))
-    for theta0, results in all_results.items():
-        plt.plot(results['t'], results['V'], label=f'θ₀ = {theta0}°', linewidth=1.5)
-    plt.xlabel('t, с')
-    plt.ylabel('V, м/с')
-    plt.title(f'Скорость V(t) {title_suffix}')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f'velocity_Vt_V{V0:.0f}.png', dpi=150)
-    plt.show()
+    # Фильтрация с шагом 1 с (как в 1-м коде: t % 1 == 0)
+    dataframe_formatted = dataframe[dataframe['t'] % 1 == 0].reset_index(drop=True)
+    dataframe_formatted.to_excel(filename, index=False)
+    print(f"[OK] Таблица сохранена: {filename}  (строк: {len(dataframe_formatted)})")
 
-    # 3. theta_c(t)
-    plt.figure(figsize=(10, 6))
-    for theta0, results in all_results.items():
-        plt.plot(results['t'], results['theta_c_deg'], label=f'θ₀ = {theta0}°', linewidth=1.5)
-    plt.xlabel('t, с')
-    plt.ylabel('θ_c, °')
-    plt.title(f'Угол наклона траектории θ_c(t) {title_suffix}')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f'theta_ct_V{V0:.0f}.png', dpi=150)
-    plt.show()
-
-    # 4. y(t)
-    plt.figure(figsize=(10, 6))
-    for theta0, results in all_results.items():
-        plt.plot(results['t'], results['y'], label=f'θ₀ = {theta0}°', linewidth=1.5)
-    plt.xlabel('t, с')
-    plt.ylabel('y, м')
-    plt.title(f'Высота y(t) {title_suffix}')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f'height_yt_V{V0:.0f}.png', dpi=150)
-    plt.show()
-
-    # 5. x(t)
-    plt.figure(figsize=(10, 6))
-    for theta0, results in all_results.items():
-        plt.plot(results['t'], results['x'], label=f'θ₀ = {theta0}°', linewidth=1.5)
-    plt.xlabel('t, с')
-    plt.ylabel('x, м')
-    plt.title(f'Дальность x(t) {title_suffix}')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f'range_xt_V{V0:.0f}.png', dpi=150)
-    plt.show()
-
-    # 6. V(x)
-    plt.figure(figsize=(10, 6))
-    for theta0, results in all_results.items():
-        plt.plot(results['x'], results['V'], label=f'θ₀ = {theta0}°', linewidth=1.5)
-    plt.xlabel('x, м')
-    plt.ylabel('V, м/с')
-    plt.title(f'Скорость V(x) {title_suffix}')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f'velocity_Vx_V{V0:.0f}.png', dpi=150)
-    plt.show()
-
-    # 7. theta_c(x)
-    plt.figure(figsize=(10, 6))
-    for theta0, results in all_results.items():
-        plt.plot(results['x'], results['theta_c_deg'], label=f'θ₀ = {theta0}°', linewidth=1.5)
-    plt.xlabel('x, м')
-    plt.ylabel('θ_c, °')
-    plt.title(f'Угол наклона θ_c(x) {title_suffix}')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f'theta_cx_V{V0:.0f}.png', dpi=150)
-    plt.show()
-
-    # 8. theta(t) — УГОЛ ТАНГАЖА (при alpha=0 совпадает с theta_c)
-    plt.figure(figsize=(10, 6))
-    for theta0, results in all_results.items():
-        plt.plot(results['t'], results['theta_deg'], label=f'θ₀ = {theta0}°', linewidth=1.5)
-    plt.xlabel('t, с')
-    plt.ylabel('ϑ, °')
-    plt.title(f'Угол тангажа ϑ(t) {title_suffix}')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f'theta_t_V{V0:.0f}.png', dpi=150)
-    plt.show()
-
-    # 9. alpha(t) — УГОЛ АТАКИ (при баллистическом полете = 0)
-    plt.figure(figsize=(10, 6))
-    for theta0, results in all_results.items():
-        plt.plot(results['t'], results['alpha_deg'], label=f'θ₀ = {theta0}°', linewidth=1.5)
-    plt.xlabel('t, с')
-    plt.ylabel('α, °')
-    plt.title(f'Угол атаки α(t) {title_suffix}\n(α = 0 при баллистическом полете без управления)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f'alpha_t_V{V0:.0f}.png', dpi=150)
-    plt.show()
-
-    # 10. omega_z(t)
-    plt.figure(figsize=(10, 6))
-    for theta0, results in all_results.items():
-        plt.plot(results['t'], results['omega_z'], label=f'θ₀ = {theta0}°', linewidth=1.5)
-    plt.xlabel('t, с')
-    plt.ylabel('ω_z, с⁻¹')
-    plt.title(f'Угловая скорость ω_z(t) {title_suffix}\n(ω_z = 0 при α = 0)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f'omega_zt_V{V0:.0f}.png', dpi=150)
-    plt.show()
 
 # ============================================================
-# ГРАФИКИ — ПУНКТ 2 (оптимальные углы)
+# ГРАФИКИ (стиль из 2-го кода, данные из 1-го)
 # ============================================================
-def plot_optimal_comparison(results1, results2, V1, V2, theta1, theta2):
-    # 1. V(t)
-    plt.figure(figsize=(10, 6))
-    plt.plot(results1['t'], results1['V'],
-            label=f'V₀ = {V1} м/с, θ₀ = {theta1:.2f}°', linewidth=1.5)
-    plt.plot(results2['t'], results2['V'],
-            label=f'V₀ = {V2} м/с, θ₀ = {theta2:.2f}°', linewidth=1.5)
-    plt.xlabel('t, с')
-    plt.ylabel('V, м/с')
-    plt.title('Сравнение оптимальных траекторий: V(t)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('optimal_Vt.png', dpi=150)
-    plt.show()
+def plot_trajectory_data(trajectories_list, x_col, y_col, legend_labels, convert_to_degrees, x_label, y_label,
+                         output_filename):
+    fig, ax = plt.subplots(figsize=(10, 6))
 
-    # 2. theta_c(t)
-    plt.figure(figsize=(10, 6))
-    plt.plot(results1['t'], results1['theta_c_deg'],
-            label=f'V₀ = {V1} м/с, θ₀ = {theta1:.2f}°', linewidth=1.5)
-    plt.plot(results2['t'], results2['theta_c_deg'],
-            label=f'V₀ = {V2} м/с, θ₀ = {theta2:.2f}°', linewidth=1.5)
-    plt.xlabel('t, с')
-    plt.ylabel('θ_c, °')
-    plt.title('Сравнение оптимальных траекторий: θ_c(t)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('optimal_theta_ct.png', dpi=150)
-    plt.show()
+    for idx, trajectory in enumerate(trajectories_list):
+        color_idx = idx % len(COLOR_PALETTE)
 
-    # 3. y(t)
-    plt.figure(figsize=(10, 6))
-    plt.plot(results1['t'], results1['y'],
-            label=f'V₀ = {V1} м/с, θ₀ = {theta1:.2f}°', linewidth=1.5)
-    plt.plot(results2['t'], results2['y'],
-            label=f'V₀ = {V2} м/с, θ₀ = {theta2:.2f}°', linewidth=1.5)
-    plt.xlabel('t, с')
-    plt.ylabel('y, м')
-    plt.title('Сравнение оптимальных траекторий: y(t)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('optimal_yt.png', dpi=150)
-    plt.show()
+        if convert_to_degrees:
+            ax.plot(trajectory[:, x_col], np.degrees(trajectory[:, y_col]),
+                    label=legend_labels[idx], color=COLOR_PALETTE[color_idx], linewidth=1.5)
+        else:
+            ax.plot(trajectory[:, x_col], trajectory[:, y_col],
+                    label=legend_labels[idx], color=COLOR_PALETTE[color_idx], linewidth=1.5)
 
-    # 4. x(t)
-    plt.figure(figsize=(10, 6))
-    plt.plot(results1['t'], results1['x'],
-            label=f'V₀ = {V1} м/с, θ₀ = {theta1:.2f}°', linewidth=1.5)
-    plt.plot(results2['t'], results2['x'],
-            label=f'V₀ = {V2} м/с, θ₀ = {theta2:.2f}°', linewidth=1.5)
-    plt.xlabel('t, с')
-    plt.ylabel('x, м')
-    plt.title('Сравнение оптимальных траекторий: x(t)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('optimal_xt.png', dpi=150)
-    plt.show()
+    ax.set_xlabel(x_label, fontsize=12)
+    ax.set_ylabel(y_label, fontsize=12)
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.set_facecolor('#f8f9fa')
+    fig.patch.set_facecolor('white')
 
-    # 5. theta(t) — УГОЛ ТАНГАЖА
-    plt.figure(figsize=(10, 6))
-    plt.plot(results1['t'], results1['theta_deg'],
-            label=f'V₀ = {V1} м/с, θ₀ = {theta1:.2f}°', linewidth=1.5)
-    plt.plot(results2['t'], results2['theta_deg'],
-            label=f'V₀ = {V2} м/с, θ₀ = {theta2:.2f}°', linewidth=1.5)
-    plt.xlabel('t, с')
-    plt.ylabel('ϑ, °')
-    plt.title('Сравнение оптимальных траекторий: ϑ(t)')
-    plt.legend()
-    plt.grid(True)
     plt.tight_layout()
-    plt.savefig('optimal_theta_t.png', dpi=150)
+    plt.savefig(output_filename, dpi=150, bbox_inches='tight')
     plt.show()
+    plt.close()
 
-    # 6. alpha(t) — УГОЛ АТАКИ
-    plt.figure(figsize=(10, 6))
-    plt.plot(results1['t'], results1['alpha_deg'],
-            label=f'V₀ = {V1} м/с, θ₀ = {theta1:.2f}°', linewidth=1.5)
-    plt.plot(results2['t'], results2['alpha_deg'],
-            label=f'V₀ = {V2} м/с, θ₀ = {theta2:.2f}°', linewidth=1.5)
-    plt.xlabel('t, с')
-    plt.ylabel('α, °')
-    plt.title('Сравнение оптимальных траекторий: α(t)\n(α = 0 при баллистическом полете)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('optimal_alpha_t.png', dpi=150)
-    plt.show()
-
-    # 7. theta_c(x)
-    plt.figure(figsize=(10, 6))
-    plt.plot(results1['x'], results1['theta_c_deg'],
-            label=f'V₀ = {V1} м/с, θ₀ = {theta1:.2f}°', linewidth=1.5)
-    plt.plot(results2['x'], results2['theta_c_deg'],
-            label=f'V₀ = {V2} м/с, θ₀ = {theta2:.2f}°', linewidth=1.5)
-    plt.xlabel('x, м')
-    plt.ylabel('θ_c, °')
-    plt.title('Сравнение оптимальных траекторий: θ_c(x)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('optimal_theta_cx.png', dpi=150)
-    plt.show()
-
-    # 8. y(x)
-    plt.figure(figsize=(10, 6))
-    plt.plot(results1['x'], results1['y'],
-            label=f'V₀ = {V1} м/с, θ₀ = {theta1:.2f}°', linewidth=1.5)
-    plt.plot(results2['x'], results2['y'],
-            label=f'V₀ = {V2} м/с, θ₀ = {theta2:.2f}°', linewidth=1.5)
-    plt.xlabel('x, м')
-    plt.ylabel('y, м')
-    plt.title('Сравнение оптимальных траекторий: y(x)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('optimal_yx.png', dpi=150)
-    plt.show()
-
-    # 9. omega_z(t)
-    plt.figure(figsize=(10, 6))
-    plt.plot(results1['t'], results1['omega_z'],
-            label=f'V₀ = {V1} м/с, θ₀ = {theta1:.2f}°', linewidth=1.5)
-    plt.plot(results2['t'], results2['omega_z'],
-            label=f'V₀ = {V2} м/с, θ₀ = {theta2:.2f}°', linewidth=1.5)
-    plt.xlabel('t, с')
-    plt.ylabel('ω_z, с⁻¹')
-    plt.title('Сравнение оптимальных траекторий: ω_z(t)\n(ω_z = 0 при α = 0)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('optimal_omega_zt.png', dpi=150)
-    plt.show()
 
 # ============================================================
 # ГЛАВНАЯ ПРОГРАММА
 # ============================================================
-if __name__ == "__main__":
+if __name__ == '__main__':
+    start_time = time.time()
 
     print("=" * 80)
     print("ДОМАШНЕЕ ЗАДАНИЕ №1")
     print("Расчет элементов траектории ЛА на пассивном участке")
-    print("Вариант 1: V01 = 230 м/с, V02 = 930 м/с")
+    print("Вариант 1: V01 = 230 м/с, V02 = 930 м/с  (6 DOF, полная аэродинамика)")
     print("=" * 80)
 
-    # ============================================================
-    # ПУНКТ 1: Интегрирование для V01 = 230 м/с и 4 углов
-    # ============================================================
+    # ----------------------------------------------------------
+    # ПУНКТ 1: 4 угла для V0 = 230 м/с
+    # ----------------------------------------------------------
     print("\n" + "=" * 80)
     print("ПУНКТ 1: Интегрирование для V0 = 230 м/с")
     print("=" * 80)
 
-    results_V1 = {}
-    for theta0_deg in theta0_degrees:
-        print(f"\n>>> Интегрирование для θ₀ = {theta0_deg}°...")
-        results = integrate_trajectory(V01, theta0_deg, dt)
-        results_V1[theta0_deg] = results
-        print_table(results, V01, theta0_deg)
+    with ProcessPoolExecutor(max_workers=4) as executor:
+        trajectory_futures = [
+            executor.submit(solve_trajectory, (V_initial_1, theta_c_start_1)),
+            executor.submit(solve_trajectory, (V_initial_1, theta_c_start_2)),
+            executor.submit(solve_trajectory, (V_initial_1, theta_c_start_3)),
+            executor.submit(solve_trajectory, (V_initial_1, theta_c_start_4))
+        ]
+        trajectory_20deg, trajectory_30deg, trajectory_40deg, trajectory_50deg = [f.result() for f in
+                                                                                  trajectory_futures]
+
+    # Сохранение таблиц (формат 1-го кода)
+    create_results_dataframe(trajectory_20deg, f'results_theta_{round(np.degrees(theta_c_start_1), 3)}_deg.xlsx')
+    create_results_dataframe(trajectory_30deg, f'results_theta_{round(np.degrees(theta_c_start_2), 3)}_deg.xlsx')
+    create_results_dataframe(trajectory_40deg, f'results_theta_{round(np.degrees(theta_c_start_3), 3)}_deg.xlsx')
+    create_results_dataframe(trajectory_50deg, f'results_theta_{round(np.degrees(theta_c_start_4), 3)}_deg.xlsx')
+
+    # Графики Пункта 1
+    trajectories_list = [trajectory_20deg, trajectory_30deg, trajectory_40deg, trajectory_50deg]
+    legend_labels = [
+        f'θ₀ = {round(np.degrees(theta_c_start_1), 3)}°',
+        f'θ₀ = {round(np.degrees(theta_c_start_2), 3)}°',
+        f'θ₀ = {round(np.degrees(theta_c_start_3), 3)}°',
+        f'θ₀ = {round(np.degrees(theta_c_start_4), 3)}°'
+    ]
 
     print("\n>>> Построение графиков для V0 = 230 м/с...")
-    plot_trajectories(results_V1, V01, "(V₀ = 230 м/с)")
+    plot_trajectory_data(trajectories_list, 3, 4, legend_labels, False, 'x, м', 'y, м',
+                         f'trajectories_yx_V{V_initial_1:.0f}.png')
+    plot_trajectory_data(trajectories_list, 0, 1, legend_labels, False, 't, с', 'V, м/с',
+                         f'velocity_Vt_V{V_initial_1:.0f}.png')
+    plot_trajectory_data(trajectories_list, 0, 2, legend_labels, True, 't, с', 'θ_c, °',
+                         f'theta_ct_V{V_initial_1:.0f}.png')
+    plot_trajectory_data(trajectories_list, 0, 4, legend_labels, False, 't, с', 'y, м',
+                         f'height_yt_V{V_initial_1:.0f}.png')
+    plot_trajectory_data(trajectories_list, 0, 3, legend_labels, False, 't, с', 'x, м',
+                         f'range_xt_V{V_initial_1:.0f}.png')
+    plot_trajectory_data(trajectories_list, 3, 1, legend_labels, False, 'x, м', 'V, м/с',
+                         f'velocity_Vx_V{V_initial_1:.0f}.png')
+    plot_trajectory_data(trajectories_list, 3, 2, legend_labels, True, 'x, м', 'θ_c, °',
+                         f'theta_cx_V{V_initial_1:.0f}.png')
+    plot_trajectory_data(trajectories_list, 0, 6, legend_labels, True, 't, с', 'ϑ, °',
+                         f'theta_t_V{V_initial_1:.0f}.png')
+    plot_trajectory_data(trajectories_list, 0, 7, legend_labels, True, 't, с', 'α, °',
+                         f'alpha_t_V{V_initial_1:.0f}.png')
+    plot_trajectory_data(trajectories_list, 0, 5, legend_labels, False, 't, с', 'ω_z, с⁻¹',
+                         f'omega_zt_V{V_initial_1:.0f}.png')
 
-    # ============================================================
-    # ПУНКТ 2: Поиск оптимальных углов
-    # ============================================================
+    # ----------------------------------------------------------
+    # ПУНКТ 2: Оптимальные углы
+    # ----------------------------------------------------------
     print("\n" + "=" * 80)
     print("ПУНКТ 2: Поиск оптимальных углов бросания")
     print("=" * 80)
 
-    print(f"\n>>> Поиск оптимального угла для V0 = {V01} м/с...")
-    theta_opt1, max_range1 = find_optimal_angle(V01, dt)
-    print(f"Оптимальный угол для V0 = {V01} м/с: θ₀_opt = {theta_opt1:.4f}°")
-    print(f"Максимальная дальность: {max_range1:.2f} м")
+    optimization_start = time.time()
 
-    print(f"\n>>> Поиск оптимального угла для V0 = {V02} м/с...")
-    theta_opt2, max_range2 = find_optimal_angle(V02, dt)
-    print(f"Оптимальный угол для V0 = {V02} м/с: θ₀_opt = {theta_opt2:.4f}°")
-    print(f"Максимальная дальность: {max_range2:.2f} м")
+    with ProcessPoolExecutor(max_workers=2) as executor:
+        optimization_futures = [
+            executor.submit(optimize_launch_angle, V_initial_1),
+            executor.submit(optimize_launch_angle, V_initial_2)
+        ]
+        opt_result_1, opt_result_2 = [f.result() for f in optimization_futures]
 
-    # Интегрирование для оптимальных углов
-    print(f"\n>>> Интегрирование для оптимального угла θ₀ = {theta_opt1:.4f}° (V0 = {V01} м/с)...")
-    results_opt1 = integrate_trajectory(V01, theta_opt1, dt)
-    print_table(results_opt1, V01, theta_opt1)
+        optimal_angle_1 = opt_result_1.x[0]
+        optimal_angle_2 = opt_result_2.x[0]
 
-    print(f"\n>>> Интегрирование для оптимального угла θ₀ = {theta_opt2:.4f}° (V0 = {V02} м/с)...")
-    results_opt2 = integrate_trajectory(V02, theta_opt2, dt)
-    print_table(results_opt2, V02, theta_opt2)
+        print(f"\nОптимальный угол для V0 = {V_initial_1} м/с: {round(np.degrees(optimal_angle_1), decimal_rounding)}°")
+        print(f"Максимальная дальность: {-opt_result_1.fun:.2f} м")
+        print(f"\nОптимальный угол для V0 = {V_initial_2} м/с: {round(np.degrees(optimal_angle_2), decimal_rounding)}°")
+        print(f"Максимальная дальность: {-opt_result_2.fun:.2f} м")
+
+        # Интегрирование для оптимальных углов
+        trajectory_futures = [
+            executor.submit(solve_trajectory, (V_initial_1, optimal_angle_1)),
+            executor.submit(solve_trajectory, (V_initial_2, optimal_angle_2))
+        ]
+        optimal_traj_1, optimal_traj_2 = [f.result() for f in trajectory_futures]
+
+    # Сохранение таблиц оптимальных траекторий
+    create_results_dataframe(optimal_traj_1,
+                             f'optimal_V0_{round(V_initial_1, 3)}_theta_{round(np.degrees(optimal_angle_1), 3)}_deg.xlsx')
+    create_results_dataframe(optimal_traj_2,
+                             f'optimal_V0_{round(V_initial_2, 3)}_theta_{round(np.degrees(optimal_angle_2), 3)}_deg.xlsx')
+
+    # Графики сравнения оптимальных траекторий
+    optimal_trajectories = [optimal_traj_1, optimal_traj_2]
+    optimal_labels = [
+        f'V₀ = {V_initial_1} м/с, θ₀ = {round(np.degrees(optimal_angle_1), 3)}°',
+        f'V₀ = {V_initial_2} м/с, θ₀ = {round(np.degrees(optimal_angle_2), 3)}°'
+    ]
 
     print("\n>>> Построение сравнительных графиков оптимальных траекторий...")
-    plot_optimal_comparison(results_opt1, results_opt2, V01, V02, theta_opt1, theta_opt2)
+    plot_trajectory_data(optimal_trajectories, 0, 1, optimal_labels, False, 't, с', 'V, м/с', 'optimal_Vt.png')
+    plot_trajectory_data(optimal_trajectories, 0, 2, optimal_labels, True, 't, с', 'θ_c, °', 'optimal_theta_ct.png')
+    plot_trajectory_data(optimal_trajectories, 0, 4, optimal_labels, False, 't, с', 'y, м', 'optimal_yt.png')
+    plot_trajectory_data(optimal_trajectories, 0, 3, optimal_labels, False, 't, с', 'x, м', 'optimal_xt.png')
+    plot_trajectory_data(optimal_trajectories, 0, 6, optimal_labels, True, 't, с', 'ϑ, °', 'optimal_theta_t.png')
+    plot_trajectory_data(optimal_trajectories, 0, 7, optimal_labels, True, 't, с', 'α, °', 'optimal_alpha_t.png')
+    plot_trajectory_data(optimal_trajectories, 3, 2, optimal_labels, True, 'x, м', 'θ_c, °', 'optimal_theta_cx.png')
+    plot_trajectory_data(optimal_trajectories, 3, 4, optimal_labels, False, 'x, м', 'y, м', 'optimal_yx.png')
+    plot_trajectory_data(optimal_trajectories, 0, 5, optimal_labels, False, 't, с', 'ω_z, с⁻¹', 'optimal_omega_zt.png')
 
-    # ============================================================
+    # ----------------------------------------------------------
     # СВОДНАЯ ТАБЛИЦА
-    # ============================================================
+    # ----------------------------------------------------------
     print("\n" + "=" * 80)
     print("СВОДНАЯ ТАБЛИЦА РЕЗУЛЬТАТОВ")
     print("=" * 80)
-    print(f"\nV0 = {V01} м/с:")
-    for theta0_deg in theta0_degrees:
-        r = results_V1[theta0_deg]['x'][-1]
-        t_f = results_V1[theta0_deg]['t'][-1]
-        print(f"  θ₀ = {theta0_deg:4.1f}° -> Дальность = {r:10.2f} м, Время = {t_f:6.2f} с")
-    print(f"  θ₀_opt = {theta_opt1:7.4f}° -> Дальность = {max_range1:10.2f} м")
 
-    print(f"\nV0 = {V02} м/с:")
-    print(f"  θ₀_opt = {theta_opt2:7.4f}° -> Дальность = {max_range2:10.2f} м")
+    theta_list = [
+        (np.degrees(theta_c_start_1), trajectory_20deg),
+        (np.degrees(theta_c_start_2), trajectory_30deg),
+        (np.degrees(theta_c_start_3), trajectory_40deg),
+        (np.degrees(theta_c_start_4), trajectory_50deg),
+    ]
 
-    print("\n" + "=" * 80)
+    print(f"\nV0 = {V_initial_1} м/с:")
+    for theta_deg, traj in theta_list:
+        print(f"  θ₀ = {theta_deg:6.2f}° -> Дальность = {traj[-1, 3]:10.2f} м, Время = {traj[-1, 0]:6.2f} с")
+    print(f"  θ₀_opt = {np.degrees(optimal_angle_1):7.4f}° -> Дальность = {optimal_traj_1[-1, 3]:10.2f} м")
+
+    print(f"\nV0 = {V_initial_2} м/с:")
+    print(f"  θ₀_opt = {np.degrees(optimal_angle_2):7.4f}° -> Дальность = {optimal_traj_2[-1, 3]:10.2f} м")
+
+    total_time = time.time() - start_time
+    print(f"\nОбщее время выполнения: {total_time:.2f} с")
+    print("=" * 80)
     print("РАСЧЕТ ЗАВЕРШЕН")
     print("=" * 80)
